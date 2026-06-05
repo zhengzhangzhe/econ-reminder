@@ -1,29 +1,26 @@
 name: Daily Economic Reminder
 
 on:
+  schedule:
+    - cron: "0 0 * * *"  # UTC 00:00 = 北京 08:00
   workflow_dispatch:
 
 jobs:
   remind:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
 
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
-      - name: Install dependencies
-        run: pip install requests
+      - run: pip install requests
 
       - name: Skip weekends
         run: |
           DOW=$(TZ='Asia/Shanghai' date +%u)
           if [ "$DOW" -ge 6 ]; then
-            echo "Weekend (Beijing), skipping"
+            echo "Weekend, skipping"
             exit 0
           fi
 
