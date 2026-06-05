@@ -1,25 +1,34 @@
 name: Daily Economic Reminder
 
 on:
-  repository_dispatch:
-    types: [remind]
-  workflow_dispatch:  # 保留手动触发，方便测试
+  schedule:
+    # 每天 UTC 00:00 = 北京时间 08:00
+    - cron: "0 0 * * *"
+  workflow_dispatch:
 
 jobs:
   remind:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install requests
+
+      - name: Skip weekends
+        run: |
+          DOW=$(TZ='Asia/Shanghai' date +%u)
+          if [ "$DOW" -ge 6 ]; then
+            echo "Weekend (Beijing), skipping"
+            exit 0
+          fi
 
       - name: Run reminder
         env:
