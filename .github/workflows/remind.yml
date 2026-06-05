@@ -1,8 +1,6 @@
 name: Daily Economic Reminder
 
 on:
-  schedule:
-    - cron: "0 0 * * *"  # UTC 00:00 = 北京 08:00
   workflow_dispatch:
 
 jobs:
