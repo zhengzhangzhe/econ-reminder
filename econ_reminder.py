@@ -149,6 +149,89 @@ INDICATOR_NAMES = {
 }
 
 
+# ── FRED 前值数据 ─────────────────────────────────────────
+# 每个指标对应的 FRED series_id 和计算方式
+
+FRED_SERIES = {
+    "CPI":     ("CPIAUCSL", "yoy_pct"),   # 消费者物价指数 → 年率
+    "NFP":     ("PAYEMS",   "mom_chg"),   # 非农就业总人数 → 月度变化(千)
+    "PCE":     ("PCEPI",    "yoy_pct"),   # PCE 物价指数 → 年率
+    "GDP":     ("GDP",      "level"),     # GDP → 季度值(十亿)
+    "PPI":     ("WPSFD4131","yoy_pct"),   # PPI 最终需求 → 年率
+    "JoblessClaims": ("ICSA", "level"),   # 初请失业金(周) → 万人
+    "RetailSales":   ("RSAFS", "mom_pct"), # 零售销售 → 月率
+    "ISM_MFG":  ("NAPM",    "level"),     # ISM 制造业 PMI → 指数
+}
+
+# FRED 数据缓存（一次请求全拿，避免多次调 API）
+_fred_cache: dict[str, list[tuple[str, float]]] = {}
+
+def _fetch_fred_series(series_id: str, api_key: str) -> list[tuple[str, float]]:
+    """获取 FRED 序列数据，返回 [(date_str, value), ...] 按日期降序"""
+    if series_id in _fred_cache:
+        return _fred_cache[series_id]
+    try:
+        r = requests.get("https://api.stlouisfed.org/fred/series/observations", params={
+            "series_id": series_id, "sort_order": "desc", "limit": 25,
+            "api_key": api_key, "file_type": "json",
+        }, timeout=15)
+        data = r.json()
+        values = [(o["date"], float(o["value"])) for o in data.get("observations", [])
+                  if o["value"] != "."]
+        _fred_cache[series_id] = values
+        return values
+    except Exception as e:
+        logger.warning(f"FRED {series_id} 获取失败: {e}")
+        return []
+
+
+def _calc_previous(key: str, api_key: str) -> str:
+    """根据指标 key 计算前值字符串，如 '3.8%' 或 '+172k'"""
+    if key not in FRED_SERIES:
+        return ""
+    series_id, method = FRED_SERIES[key]
+    values = _fetch_fred_series(series_id, api_key)
+    if len(values) < 2:
+        return ""
+
+    curr_val = values[0][1]
+    prev_val = values[1][1]
+
+    if method == "yoy_pct":
+        # 找去年同月
+        curr_date = values[0][0]
+        year = int(curr_date[:4])
+        month = curr_date[5:7]
+        target = f"{year-1}-{month}"
+        matches = [v for v in values if v[0].startswith(target)]
+        if matches:
+            yoy = (curr_val / matches[0][1] - 1) * 100
+            return f"{yoy:+.1f}%"
+        return ""
+
+    elif method == "mom_chg":
+        change = curr_val - prev_val
+        return f"{change:+.0f}k"
+
+    elif method == "mom_pct":
+        if prev_val != 0:
+            mom = (curr_val / prev_val - 1) * 100
+            return f"{mom:+.1f}%"
+        return ""
+
+    elif method == "level":
+        # 直接显示值
+        if key == "JoblessClaims":
+            return f"{curr_val/10000:.1f}万"  # 直接数 → 万
+        elif key == "ISM_MFG":
+            return f"{curr_val:.1f}"
+        elif key == "GDP":
+            return f"{curr_val:.0f}B"
+        return f"{curr_val:.1f}"
+
+    return ""
+
+
 # ── 2026 下半年精确排期（硬编码） ─────────────────────────
 # 格式: { date: [(key, time_str, notes), ...] }
 # 时间已是北京时间
@@ -333,7 +416,7 @@ def _this_week_range() -> tuple[date, date]:
     return mon, mon + timedelta(days=4)
 
 
-def get_week_indicators(mon: date, fri: date) -> list[dict]:
+def get_week_indicators(mon: date, fri: date, fred_api_key: str = "") -> list[dict]:
     """汇总硬编码 + 算法兜底，返回本周指标列表"""
     by_date: dict[date, list[dict]] = {}
     seen: set[tuple[date, str]] = set()
@@ -343,12 +426,14 @@ def get_week_indicators(mon: date, fri: date) -> list[dict]:
             return
         seen.add((d, key))
         meta = INDICATOR_META[key]
+        previous = _calc_previous(key, fred_api_key) if fred_api_key else ""
         by_date.setdefault(d, []).append({
             "date": d,
             "name": INDICATOR_NAMES[key],
             "time": time_str,
             "impact": meta["impact"],
             "estimated": estimated,
+            "previous": previous,
             "gold": meta["gold"],
             "stock": meta["stock"],
         })
@@ -375,6 +460,27 @@ def get_week_indicators(mon: date, fri: date) -> list[dict]:
 
 # ── 格式化 ────────────────────────────────────────────────
 
+def _direction_hint(name: str, prev: str) -> str:
+    """根据前值给出一句话市场影响提示"""
+    hints = {
+        "CPI": "通胀仍高 → 关注是否超预期上行",
+        "PCE": "PCE 是美联储最看重的通胀指标",
+        "PPI": "PPI 是 CPI 的先行指标，关注传导效应",
+        "非农": "就业强劲 → 降息预期推迟；走弱 → 降息预期提前",
+        "零售": "消费是美国经济 70%，直接影响 GDP 预期",
+        "GDP": "观察经济是否在放缓通道",
+        "初请": "连续走高需警惕就业市场恶化",
+        "ISM": "50 = 荣枯线，低于 50 为收缩信号",
+        "JOLTs": "职位空缺下降 → 就业市场降温",
+        "密歇根": "通胀预期是美联储关注的前瞻指标",
+        "FOMC": "本次重点关注点阵图和鲍威尔措辞",
+    }
+    for kw, hint in hints.items():
+        if kw in name:
+            return f"💡 {hint}"
+    return ""
+
+
 def format_weekly(indicators: list[dict]) -> str:
     mon, fri = _this_week_range()
     impact_emoji = {"high": "🔴", "medium": "🟡", "low": "🟢"}
@@ -399,7 +505,14 @@ def format_weekly(indicators: list[dict]) -> str:
             for r in by_date[d]:
                 emoji = impact_emoji.get(r["impact"], "⚪")
                 est = "（预计）" if r.get("estimated") else ""
+                prev = r.get("previous", "")
                 lines.append(f"{emoji} **{r['name']}**{est}  {r['time']}（北京）")
+                if prev:
+                    lines.append(f"　前值 {prev}")
+                    # 一行方向判断
+                    direction = _direction_hint(r["name"], prev)
+                    if direction:
+                        lines.append(f"　{direction}")
                 lines.append(f"　📈 股市：{r['stock'].split(chr(10))[0]}")
                 lines.append(f"　🥇 金价：{r['gold'].split(chr(10))[0]}")
                 lines.append("")
@@ -432,7 +545,7 @@ def main():
         return
 
     mon, fri = _this_week_range()
-    indicators = get_week_indicators(mon, fri)
+    indicators = get_week_indicators(mon, fri, config["fred_api_key"])
     logger.info(f"本周 {mon} ~ {fri}，共 {len(indicators)} 个指标")
     for r in indicators:
         logger.info(f"  {r['date']} {r['name']} ({r['time']})")
