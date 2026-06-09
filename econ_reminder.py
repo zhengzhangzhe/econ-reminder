@@ -5,7 +5,9 @@
 每周一北京时间 8:00 运行，推送本周（周一至周五）美国要发布的
 经济指标，包括对股市、金价的影响分析。
 
-指标日期来自算法计算 + 硬编码 FOMC 日程，比 FRED API 更准确。
+数据来源：
+  - FOMC: federalreserve.gov 官网
+  - 其余指标: 2026 下半年精确排期 + 算法兜底
 """
 
 import os
@@ -16,16 +18,14 @@ from datetime import date, datetime, timezone, timedelta
 
 import requests
 
-# ── 日志 ──────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("econ-reminder")
 
 BEIJING_TZ = timezone(timedelta(hours=8))
-WEEKDAY_NAMES = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+WD = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 
+
+# ── 配置 ──────────────────────────────────────────────────
 
 def load_config() -> dict:
     config = {
@@ -44,25 +44,184 @@ def load_config() -> dict:
     return config
 
 
-# ── FOMC 2026 日程（来源：federalreserve.gov/monetarypolicy/fomccalendars.htm）──
-# 已转为北京时间：美国 14:00 ET 发布会 → 北京次日 02:00
-# * = 含经济预测摘要 (SEP)
-FOMC_2026_BEIJING = [
-    date(2026, 1, 29),   # Jan 27-28 → announcement Jan 28 US → Beijing Jan 29
-    date(2026, 3, 19),   # Mar 17-18* → announcement Mar 18 → Beijing Mar 19
-    date(2026, 4, 30),   # Apr 28-29 → announcement Apr 29 → Beijing Apr 30
-    date(2026, 6, 18),   # Jun 16-17* → announcement Jun 17 → Beijing Jun 18
-    date(2026, 7, 30),   # Jul 28-29 → announcement Jul 29 → Beijing Jul 30
-    date(2026, 9, 17),   # Sep 15-16* → announcement Sep 16 → Beijing Sep 17
-    date(2026, 10, 29),  # Oct 27-28 → announcement Oct 28 → Beijing Oct 29
-    date(2026, 12, 10),  # Dec 8-9* → announcement Dec 9 → Beijing Dec 10
-]
+# ── 夏令时 ─────────────────────────────────────────────────
+# 美国 DST: 3月第二个周日 → 11月第一个周日
+# 夏季 (EDT): 3-10月, 8:30 ET = 20:30 北京
+# 冬季 (EST): 11-2月, 8:30 ET = 21:30 北京
 
-# ── 算法：计算各指标的发布日期 ────────────────────────────
+def _is_dst(d: date) -> bool:
+    """date 是否在美国夏令时期间"""
+    # DST starts: 2nd Sunday of March
+    mar_1 = date(d.year, 3, 1)
+    dst_start = mar_1 + timedelta(days=(6 - mar_1.weekday() + 7) % 7 + 7)
+    # DST ends: 1st Sunday of November
+    nov_1 = date(d.year, 11, 1)
+    dst_end = nov_1 + timedelta(days=(6 - nov_1.weekday() + 7) % 7)
+    return dst_start <= d < dst_end
 
 
-def _first_weekday_of_month(year: int, month: int, weekday: int) -> date:
-    """返回某月第 N 个周几的日期（weekday: 0=Mon, 4=Fri）"""
+def _et_time(d: date, us_hour: int = 8, us_minute: int = 30) -> str:
+    """将美国东部时间转为北京时间字符串"""
+    offset = 12 if _is_dst(d) else 13
+    beijing_hour = us_hour + offset
+    return f"{beijing_hour:02d}:{us_minute:02d}"
+
+
+# ── 指标定义 ──────────────────────────────────────────────
+# name, impact, gold_msg, stock_msg
+
+INDICATOR_META = {
+    "FOMC": {
+        "impact": "high",
+        "gold": "鹰派 → 利空金价\n鸽派 → 利好金价",
+        "stock": "鹰派 → 利空股市\n鸽派 → 利好股市",
+    },
+    "NFP": {
+        "impact": "high",
+        "gold": "超预期 → 利空金价\n低于预期 → 利好金价",
+        "stock": "超预期 → 利好股市（软着陆）\n低于预期 → 利空股市",
+    },
+    "CPI": {
+        "impact": "high",
+        "gold": "超预期 → 利空金价\n低于预期 → 利好金价",
+        "stock": "超预期 → 利空股市（加息预期）\n低于预期 → 利好股市",
+    },
+    "PCE": {
+        "impact": "medium",
+        "gold": "超预期 → 利空金价\n低于预期 → 利好金价",
+        "stock": "超预期 → 利空股市\n低于预期 → 利好股市",
+    },
+    "PPI": {
+        "impact": "medium",
+        "gold": "超预期 → 利空金价（通胀压力）\n低于预期 → 利好金价",
+        "stock": "超预期 → 利空股市\n低于预期 → 利好股市",
+    },
+    "ISM_MFG": {
+        "impact": "medium",
+        "gold": "超预期 → 利空金价（经济强）\n低于预期 → 利好金价（避险）",
+        "stock": "超预期 → 利好股市（经济强）\n低于预期 → 利空股市（衰退信号）",
+    },
+    "ISM_SVC": {
+        "impact": "low",
+        "gold": "超预期 → 略利空金价\n低于预期 → 略利好金价",
+        "stock": "超预期 → 利好股市\n低于预期 → 利空股市",
+    },
+    "RetailSales": {
+        "impact": "medium",
+        "gold": "超预期 → 利空金价（消费强）\n低于预期 → 利好金价",
+        "stock": "超预期 → 利好消费股\n低于预期 → 利空消费股",
+    },
+    "JOLTS": {
+        "impact": "medium",
+        "gold": "超预期 → 利空金价（就业紧）\n低于预期 → 利好金价",
+        "stock": "超预期 → 利空股市（工资通胀）\n低于预期 → 利好股市",
+    },
+    "JoblessClaims": {
+        "impact": "low",
+        "gold": "高于预期 → 利好金价（避险）\n低于预期 → 利空金价",
+        "stock": "高于预期 → 利空股市\n低于预期 → 利好股市",
+    },
+    "GDP": {
+        "impact": "medium",
+        "gold": "超预期 → 利空金价\n低于预期 → 利好金价",
+        "stock": "超预期 → 利好股市\n低于预期 → 利空股市",
+    },
+    "Michigan": {
+        "impact": "low",
+        "gold": "通胀预期升 → 利空金价\n通胀预期降 → 利好金价",
+        "stock": "通胀预期升 → 利空股市\n信心强 → 利好消费股",
+    },
+}
+
+INDICATOR_NAMES = {
+    "FOMC": "FOMC 利率决议",
+    "NFP": "非农就业 (NFP)",
+    "CPI": "CPI 消费者物价指数",
+    "PCE": "核心 PCE 物价指数",
+    "PPI": "PPI 生产者物价指数",
+    "ISM_MFG": "ISM 制造业 PMI",
+    "ISM_SVC": "ISM 服务业 PMI",
+    "RetailSales": "零售销售月率",
+    "JOLTS": "JOLTs 职位空缺",
+    "JoblessClaims": "初请失业金人数",
+    "GDP": "GDP 季率",
+    "Michigan": "密歇根消费者信心初值",
+}
+
+
+# ── 2026 下半年精确排期（硬编码） ─────────────────────────
+# 格式: { date: [(key, time_str, notes), ...] }
+# 时间已是北京时间
+
+CALENDAR_2026_H2: dict[date, list[tuple[str, str, str]]] = {}
+
+def _add(d: date, key: str, time_str: str):
+    CALENDAR_2026_H2.setdefault(d, []).append((key, time_str, ""))
+
+# ── 6月 ──
+_add(date(2026,6,10), "CPI", "20:30")
+_add(date(2026,6,11), "PPI", "20:30")
+_add(date(2026,6,17), "RetailSales", "20:30")
+_add(date(2026,6,18), "FOMC", "02:00")
+_add(date(2026,6,25), "PCE", "20:30")
+
+# ── 7月 ──
+_add(date(2026,7,2), "NFP", "20:30")  # 独立日提前
+_add(date(2026,7,14), "CPI", "20:30")
+_add(date(2026,7,15), "PPI", "20:30")
+_add(date(2026,7,16), "RetailSales", "20:30")
+_add(date(2026,7,30), "PCE", "20:30")
+_add(date(2026,7,30), "GDP", "20:30")
+_add(date(2026,7,30), "FOMC", "02:00")
+
+# ── 8月 ──
+_add(date(2026,8,7), "NFP", "20:30")
+_add(date(2026,8,12), "CPI", "20:30")
+_add(date(2026,8,13), "PPI", "20:30")
+_add(date(2026,8,14), "RetailSales", "20:30")
+_add(date(2026,8,26), "PCE", "20:30")
+
+# ── 9月 ──
+_add(date(2026,9,4), "NFP", "20:30")
+_add(date(2026,9,10), "PPI", "20:30")
+_add(date(2026,9,11), "CPI", "20:30")
+_add(date(2026,9,16), "RetailSales", "20:30")
+_add(date(2026,9,17), "FOMC", "02:00")
+_add(date(2026,9,30), "PCE", "20:30")
+
+# ── 10月 ──
+_add(date(2026,10,2), "NFP", "20:30")
+_add(date(2026,10,14), "CPI", "20:30")
+_add(date(2026,10,15), "RetailSales", "20:30")
+_add(date(2026,10,29), "FOMC", "02:00")
+_add(date(2026,10,29), "PCE", "20:30")
+_add(date(2026,10,29), "GDP", "20:30")
+
+# ── 11月（冬令时开始） ──
+_add(date(2026,11,6), "NFP", "21:30")
+_add(date(2026,11,10), "CPI", "21:30")
+_add(date(2026,11,17), "RetailSales", "21:30")
+_add(date(2026,11,25), "PCE", "21:30")  # 感恩节提前
+
+# ── 12月 ──
+_add(date(2026,12,4), "NFP", "21:30")
+_add(date(2026,12,10), "CPI", "21:30")
+_add(date(2026,12,10), "FOMC", "03:00")  # 冬令时 2PM ET = 3AM 北京
+_add(date(2026,12,16), "RetailSales", "21:30")
+_add(date(2026,12,23), "PCE", "21:30")  # 圣诞提前
+
+
+# ── FOMC 2026 上半年（官网已验证，北京时间） ─────────────
+FOMC_H1_BEIJING = {
+    date(2026, 1, 29),  # Jan 27-28 → Jan 29 Beijing
+    date(2026, 3, 19),  # Mar 17-18 → Mar 19 Beijing
+    date(2026, 4, 30),  # Apr 28-29 → Apr 30 Beijing
+}
+
+
+# ── 算法兜底 ──────────────────────────────────────────────
+
+def _first_weekday(year: int, month: int, weekday: int) -> date:
     d = date(year, month, 1)
     while d.weekday() != weekday:
         d += timedelta(days=1)
@@ -70,181 +229,194 @@ def _first_weekday_of_month(year: int, month: int, weekday: int) -> date:
 
 
 def _weekday_near(year: int, month: int, day: int) -> date:
-    """返回某月 day 号附近最近的周一到周五"""
     d = date(year, month, day)
-    while d.weekday() >= 5:  # 跳过周末
+    while d.weekday() >= 5:
         d += timedelta(days=1)
     return d
 
 
-def _calculate_indicators(mon: date, fri: date) -> list[dict]:
-    """纯算法计算本周一至周五之间发布的指标"""
+def _calc_fallback(mon: date, fri: date) -> list[dict]:
+    """算法计算补充指标（Jobless Claims, ISM PMI, JOLTs, Michigan 等）"""
     results = []
 
-    # ── 初请失业金人数：每周四 ──
+    # ── 初请失业金：每周四 ──
     d = mon
     while d <= fri:
-        if d.weekday() == 3:  # 周四
+        if d.weekday() == 3:
             results.append({
-                "date": d, "name": "初请失业金人数", "time": "20:30",
-                "impact": "medium",
-                "estimated": False,  # 每周四固定
-                "description": "美国劳动力市场高频领先指标",
-                "gold": "高于预期 → 利好金价（避险）\n低于预期 → 利空金价",
-                "stock": "高于预期 → 利空股市\n低于预期 → 利好股市",
+                "date": d, "key": "JoblessClaims",
+                "time": _et_time(d),  # 8:30 ET
             })
         d += timedelta(days=1)
 
-    # ── 非农就业 (NFP)：每月第一个周五 ──
-    for month_val in sorted({mon.month, fri.month}):
-        nfp = _first_weekday_of_month(mon.year if month_val >= mon.month else fri.year,
-                                       month_val, 4)  # 4=Friday
+    # ── NFP 算法兜底（仅当该月无硬编码 NFP 时） ──
+    nfp_hardcoded_months = {
+        d.month for d, items in CALENDAR_2026_H2.items()
+        if any(x[0] == "NFP" for x in items)
+    }
+    for m in sorted({mon.month, fri.month}):
+        if m in nfp_hardcoded_months:
+            continue  # 已被硬编码覆盖
+        nfp = _first_weekday(mon.year if m >= mon.month else fri.year, m, 4)
         if mon <= nfp <= fri:
             results.append({
-                "date": nfp, "name": "非农就业 (NFP)", "time": "20:30",
-                "impact": "high",
-                "estimated": True, "description": "美国就业市场最全面的月度报告",
-                "gold": "超预期 → 利空金价（美元走强）\n低于预期 → 利好金价（避险升温）",
-                "stock": "超预期 → 利好股市（经济强劲）\n低于预期 → 利空股市（衰退担忧）",
+                "date": nfp, "key": "NFP",
+                "time": _et_time(nfp),
             })
 
-    # ── CPI：每月 10 号附近（BLS 通常在 10-15 号发布，多为周三/周四） ──
-    for month_val in sorted({mon.month, fri.month}):
-        cpi = _weekday_near(mon.year if month_val >= mon.month else fri.year,
-                            month_val, 10)
-        # CPI 通常不在周一周二
-        while cpi.weekday() < 2:
-            cpi += timedelta(days=1)
-        while cpi.weekday() >= 5:
-            cpi += timedelta(days=1)
-        if mon <= cpi <= fri:
+    # ── ISM 制造业 PMI：每月第 1 个工作日 ──
+    for m in sorted({mon.month, fri.month}):
+        ism = date(mon.year if m >= mon.month else fri.year, m, 1)
+        while ism.weekday() >= 5:
+            ism += timedelta(days=1)
+        if mon <= ism <= fri:
             results.append({
-                "date": cpi, "name": "CPI 消费者物价指数", "time": "20:30",
-                "impact": "high",
-                "estimated": True, "description": "衡量通货膨胀最核心的指标",
-                "gold": "超预期 → 利空金价（加息预期升温）\n低于预期 → 利好金价（加息预期降温）",
-                "stock": "超预期 → 利空股市（加息预期）\n低于预期 → 利好股市（宽松预期）",
+                "date": ism, "key": "ISM_MFG",
+                "time": _et_time(ism, 10, 0),  # 10:00 ET
             })
 
-    # ── FOMC 利率决议：硬编码日程（已是北京时间） ──
-    for fomc_date in FOMC_2026_BEIJING:
+    # ── ISM 服务业 PMI：每月第 3 个工作日 ──
+    for m in sorted({mon.month, fri.month}):
+        ism = date(mon.year if m >= mon.month else fri.year, m, 1)
+        workdays = 0
+        while workdays < 3:
+            if ism.weekday() < 5:
+                workdays += 1
+            if workdays < 3:
+                ism += timedelta(days=1)
+        if mon <= ism <= fri:
+            results.append({
+                "date": ism, "key": "ISM_SVC",
+                "time": _et_time(ism, 10, 0),
+            })
+
+    # ── JOLTs：每月第一周（大约 1-3 号附近） ──
+    for m in sorted({mon.month, fri.month}):
+        jolts = _weekday_near(mon.year if m >= mon.month else fri.year, m, 2)
+        while jolts.day > 7:
+            jolts -= timedelta(days=7)
+        while jolts.month != m:
+            jolts += timedelta(days=1)
+        if mon <= jolts <= fri:
+            results.append({
+                "date": jolts, "key": "JOLTS",
+                "time": _et_time(jolts, 10, 0),
+            })
+
+    # ── 密歇根消费者信心初值：每月第 2 或第 3 个周五 ──
+    for m in sorted({mon.month, fri.month}):
+        d2 = date(mon.year if m >= mon.month else fri.year, m, 8)
+        while d2.weekday() != 4:
+            d2 += timedelta(days=1)
+        if mon <= d2 <= fri:
+            results.append({
+                "date": d2, "key": "Michigan",
+                "time": _et_time(d2, 10, 0),
+            })
+
+    # ── FOMC 上半年 ──
+    for fomc_date in FOMC_H1_BEIJING:
         if mon <= fomc_date <= fri:
             results.append({
-                "date": fomc_date, "name": "FOMC 利率决议", "time": "02:00",
-                "impact": "high",
-                "estimated": False, "description": "美联储议息会议利率决定",
-                "gold": "鹰派（加息/偏鹰）→ 利空金价\n鸽派（降息/偏鸽）→ 利好金价",
-                "stock": "鹰派 → 利空股市\n鸽派 → 利好股市（资金面宽松）",
+                "date": fomc_date, "key": "FOMC",
+                "time": "03:00" if fomc_date.month <= 3 else "02:00",
             })
-
-    # ── GDP 季率：季度结束后约一个月 ──
-    gdp_months = {1: date(mon.year, 1, 27), 4: date(mon.year, 4, 27),
-                  7: date(mon.year, 7, 27), 10: date(mon.year, 10, 27)}
-    for g in gdp_months.values():
-        gdp_date = _weekday_near(g.year, g.month, g.day)
-        if mon <= gdp_date <= fri:
-            results.append({
-                "date": gdp_date, "name": "GDP 季率（初值）", "time": "20:30",
-                "impact": "medium",
-                "estimated": True, "description": "美国经济增长综合指标",
-                "gold": "超预期 → 利空金价（美元强）\n低于预期 → 利好金价（避险）",
-                "stock": "超预期 → 利好股市\n低于预期 → 利空股市",
-            })
-
-    # ── 核心 PCE：每月月底 ──
-    for month_val in sorted({mon.month, fri.month}):
-        pce = _weekday_near(mon.year if month_val >= mon.month else fri.year,
-                            month_val, 27)
-        if mon <= pce <= fri:
-            results.append({
-                "date": pce, "name": "核心 PCE 物价指数", "time": "20:30",
-                "impact": "medium",
-                "estimated": True, "description": "美联储最看重的通胀指标",
-                "gold": "超预期 → 利空金价\n低于预期 → 利好金价",
-                "stock": "超预期 → 利空股市（加息压力）\n低于预期 → 利好股市",
-            })
-
-    # ── 零售销售：每月中旬（16号附近，通常周二-周四） ──
-    for month_val in sorted({mon.month, fri.month}):
-        rs = _weekday_near(mon.year if month_val >= mon.month else fri.year,
-                           month_val, 16)
-        while rs.weekday() < 1 or rs.weekday() >= 5:
-            rs += timedelta(days=1)
-        if mon <= rs <= fri:
-            results.append({
-                "date": rs, "name": "零售销售月率", "time": "20:30",
-                "impact": "low",
-                "estimated": True, "description": "美国消费支出强度指标",
-                "gold": "超预期 → 略利空金价\n低于预期 → 略利好金价",
-                "stock": "超预期 → 利好消费板块\n低于预期 → 利空消费板块",
-            })
-
-    # 按日期和影响排序，去重（同一天同名只保留一个）
-    seen = set()
-    results = [r for r in sorted(results, key=lambda r: r["date"])
-               if not (seen.add((r["date"], r["name"])) and False)]
 
     return results
 
 
-# ── 周范围计算 ────────────────────────────────────────────
+# ── 汇总 ──────────────────────────────────────────────────
 
 def _this_week_range() -> tuple[date, date]:
     now = datetime.now(BEIJING_TZ).date()
     mon = now - timedelta(days=now.weekday())
-    fri = mon + timedelta(days=4)
-    return mon, fri
+    return mon, mon + timedelta(days=4)
 
 
-# ── 消息格式化 ────────────────────────────────────────────
+def get_week_indicators(mon: date, fri: date) -> list[dict]:
+    """汇总硬编码 + 算法兜底，返回本周指标列表"""
+    by_date: dict[date, list[dict]] = {}
+    seen: set[tuple[date, str]] = set()
 
-def format_weekly_message(indicators: list[dict]) -> str:
+    def add(d: date, key: str, time_str: str, estimated: bool):
+        if (d, key) in seen:
+            return
+        seen.add((d, key))
+        meta = INDICATOR_META[key]
+        by_date.setdefault(d, []).append({
+            "date": d,
+            "name": INDICATOR_NAMES[key],
+            "time": time_str,
+            "impact": meta["impact"],
+            "estimated": estimated,
+            "gold": meta["gold"],
+            "stock": meta["stock"],
+        })
+
+    # 1. 硬编码日历
+    for d, items in CALENDAR_2026_H2.items():
+        if mon <= d <= fri:
+            for key, time_str, _ in items:
+                add(d, key, time_str, estimated=False)
+
+    # 2. 算法兜底
+    for r in _calc_fallback(mon, fri):
+        add(r["date"], r["key"], r["time"], estimated=True)
+
+    # 3. 按日期 + 影响排序
+    result = []
+    for d in sorted(by_date.keys()):
+        items = by_date[d]
+        items.sort(key=lambda r: {"high": 0, "medium": 1, "low": 2}[r["impact"]])
+        result.extend(items)
+
+    return result
+
+
+# ── 格式化 ────────────────────────────────────────────────
+
+def format_weekly(indicators: list[dict]) -> str:
     mon, fri = _this_week_range()
     impact_emoji = {"high": "🔴", "medium": "🟡", "low": "🟢"}
-
-    messages = [f"## 📅 本周经济指标（{mon.strftime('%m/%d')} - {fri.strftime('%m/%d')}）\n"]
-    messages.append(f"共 **{len(indicators)}** 个重要事件\n")
 
     # 按天分组
     by_date: dict[date, list[dict]] = {}
     for r in indicators:
         by_date.setdefault(r["date"], []).append(r)
 
-    # 无事件的日期也标出来
+    lines = [f"## 📅 本周经济指标（{mon.strftime('%m/%d')} - {fri.strftime('%m/%d')}）\n"]
+    total = len(indicators)
+    lines.append(f"共 **{total}** 个事件\n")
+
     d = mon
     while d <= fri:
-        day_label = f"{d.strftime('%m/%d')} {WEEKDAY_NAMES[d.weekday()]}"
+        day_label = f"{d.strftime('%m/%d')} {WD[d.weekday()]}"
+        lines.append(f"### {day_label}")
 
         if d not in by_date:
-            messages.append(f"### {day_label}")
-            messages.append("🟢 _暂无重要指标_\n")
+            lines.append("🟢 _暂无_\n")
         else:
-            messages.append(f"### {day_label}")
             for r in by_date[d]:
                 emoji = impact_emoji.get(r["impact"], "⚪")
-                est_tag = "（预计）" if r.get("estimated") else ""
-                messages.append(f"{emoji} **{r['name']}**{est_tag}  {r['time']}（北京）")
-                messages.append(f"　📈 股市：{r['stock'].split(chr(10))[0]}")
-                messages.append(f"　🥇 金价：{r['gold'].split(chr(10))[0]}")
-                messages.append("")
-        messages.append("")
+                est = "（预计）" if r.get("estimated") else ""
+                lines.append(f"{emoji} **{r['name']}**{est}  {r['time']}（北京）")
+                lines.append(f"　📈 股市：{r['stock'].split(chr(10))[0]}")
+                lines.append(f"　🥇 金价：{r['gold'].split(chr(10))[0]}")
+                lines.append("")
+        lines.append("")
         d += timedelta(days=1)
 
-    messages.append(f"> 🤖 每周一早 8:00 自动推送 | 算法计算 + FOMC 硬编码")
-    return "\n".join(messages)
+    lines.append("> 🤖 每周一早 8:00 自动推送 | 精确排期 + 算法兜底")
+    return "\n".join(lines)
 
 
 def send_wechat(send_key: str, title: str, content: str) -> bool:
     url = f"https://sctapi.ftqq.com/{send_key}.send"
     try:
         resp = requests.post(url, data={"title": title, "desp": content}, timeout=15)
-        if resp.json().get("code") == 0:
-            logger.info("微信推送成功")
-            return True
-        logger.error(f"推送失败: {resp.json()}")
-        return False
+        return resp.json().get("code") == 0
     except requests.RequestException as e:
-        logger.error(f"Server酱 请求失败: {e}")
+        logger.error(f"Server酱 失败: {e}")
         return False
 
 
@@ -255,30 +427,29 @@ def main():
 
     if "--test" in sys.argv:
         send_wechat(config["server_chan_key"],
-                     "🧪 经济指标提醒 - 测试消息",
-                     "如果你收到这条消息，说明配置正确！")
-        print("已发送测试消息")
+                     "🧪 测试消息", "配置正确！")
+        print("已发送测试")
         return
 
     mon, fri = _this_week_range()
-    indicators = _calculate_indicators(mon, fri)
+    indicators = get_week_indicators(mon, fri)
     logger.info(f"本周 {mon} ~ {fri}，共 {len(indicators)} 个指标")
     for r in indicators:
-        logger.info(f"  {r['date']} {r['name']}")
+        logger.info(f"  {r['date']} {r['name']} ({r['time']})")
 
     if not indicators:
-        logger.info("本周无关注的经济指标")
+        logger.info("本周无指标")
         return
 
-    content = format_weekly_message(indicators)
+    content = format_weekly(indicators)
 
     if "--dry-run" in sys.argv:
         print(content)
         return
 
-    send_wechat(config["server_chan_key"],
-                f"📅 本周经济指标（{mon.strftime('%m/%d')}-{fri.strftime('%m/%d')}）",
-                content)
+    title = f"📅 本周经济指标（{mon.strftime('%m/%d')}-{fri.strftime('%m/%d')}）"
+    ok = send_wechat(config["server_chan_key"], title, content)
+    logger.info("推送成功" if ok else "推送失败")
 
 
 if __name__ == "__main__":
