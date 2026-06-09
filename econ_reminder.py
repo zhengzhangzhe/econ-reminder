@@ -5,15 +5,14 @@
 每周一北京时间 8:00 运行，推送本周（周一至周五）美国要发布的
 经济指标，包括对股市、金价的影响分析。
 
-数据来源：FRED API (https://fred.stlouisfed.org/)
-推送服务：Server酱 (https://sct.ftqq.com/)
+指标日期来自算法计算 + 硬编码 FOMC 日程，比 FRED API 更准确。
 """
 
 import os
 import sys
 import json
 import logging
-from datetime import datetime, timezone, timedelta
+from datetime import date, datetime, timezone, timedelta
 
 import requests
 
@@ -24,7 +23,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("econ-reminder")
 
-# ── 配置 ──────────────────────────────────────────────────
 BEIJING_TZ = timezone(timedelta(hours=8))
 WEEKDAY_NAMES = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 
@@ -46,209 +44,237 @@ def load_config() -> dict:
     return config
 
 
-# ── 指标定义 ──────────────────────────────────────────────
-INDICATORS = {
-    50: {
-        "name": "非农就业 (NFP)",
-        "time": "20:30",
-        "impact": "high",
-        "description": "美国就业市场最全面的月度报告",
-        "gold": "超预期 → 利空金价（美元走强）\n低于预期 → 利好金价（避险升温）",
-        "stock": "超预期 → 利好股市（经济强劲）\n低于预期 → 利空股市（衰退担忧）",
-    },
-    10: {
-        "name": "CPI 消费者物价指数",
-        "time": "20:30",
-        "impact": "high",
-        "description": "衡量通货膨胀最核心的指标",
-        "gold": "超预期 → 利空金价（加息预期升温）\n低于预期 → 利好金价（加息预期降温）",
-        "stock": "超预期 → 利空股市（加息预期）\n低于预期 → 利好股市（宽松预期）",
-    },
-    101: {
-        "name": "FOMC 利率决议",
-        "time": "02:00（次日凌晨）",
-        "impact": "high",
-        "description": "美联储议息会议利率决定",
-        "gold": "鹰派（加息/偏鹰）→ 利空金价\n鸽派（降息/偏鸽）→ 利好金价",
-        "stock": "鹰派 → 利空股市\n鸽派 → 利好股市（资金面宽松）",
-    },
-    54: {
-        "name": "核心 PCE 物价指数",
-        "time": "20:30",
-        "impact": "medium",
-        "description": "美联储最看重的通胀指标",
-        "gold": "超预期 → 利空金价\n低于预期 → 利好金价",
-        "stock": "超预期 → 利空股市（加息压力）\n低于预期 → 利好股市",
-    },
-    180: {
-        "name": "初请失业金人数",
-        "time": "20:30",
-        "impact": "medium",
-        "description": "美国劳动力市场高频领先指标",
-        "gold": "高于预期 → 利好金价（避险需求）\n低于预期 → 利空金价",
-        "stock": "高于预期 → 利空股市\n低于预期 → 利好股市",
-    },
-    53: {
-        "name": "GDP 季率",
-        "time": "20:30",
-        "impact": "medium",
-        "description": "美国经济增长综合指标",
-        "gold": "超预期 → 利空金价（美元强）\n低于预期 → 利好金价（避险）",
-        "stock": "超预期 → 利好股市\n低于预期 → 利空股市",
-    },
-    9: {
-        "name": "零售销售月率",
-        "time": "20:30",
-        "impact": "low",
-        "description": "美国消费支出强度指标",
-        "gold": "超预期 → 略利空金价\n低于预期 → 略利好金价",
-        "stock": "超预期 → 利好消费板块\n低于预期 → 利空消费板块",
-    },
-}
+# ── FOMC 2026 日程（美联储提前公布） ──────────────────────
+# 格式: (声明发布日期, "描述")
+# FOMC 每次会议结束当天（通常是周三）下午 2:00 ET 发布声明
+FOMC_2026 = [
+    date(2026, 1, 28),
+    date(2026, 3, 18),
+    date(2026, 5, 6),
+    date(2026, 6, 17),
+    date(2026, 7, 29),
+    date(2026, 9, 16),
+    date(2026, 11, 5),
+    date(2026, 12, 16),
+]
+
+# ── 算法：计算各指标的发布日期 ────────────────────────────
 
 
-# ── 核心逻辑 ──────────────────────────────────────────────
-
-def _beijing_now() -> datetime:
-    return datetime.now(BEIJING_TZ)
-
-
-def _this_week_range() -> tuple[str, str, str, str]:
-    """返回本周周一-周五的日期范围和显示字符串"""
-    now = _beijing_now()
-    monday = now - timedelta(days=now.weekday())  # 本周一
-    friday = monday + timedelta(days=4)            # 本周五
-
-    monday_str = monday.strftime("%Y-%m-%d")
-    friday_str = friday.strftime("%Y-%m-%d")
-    display_start = monday.strftime("%m/%d")
-    display_end = friday.strftime("%m/%d")
-
-    return monday_str, friday_str, display_start, display_end
+def _first_weekday_of_month(year: int, month: int, weekday: int) -> date:
+    """返回某月第 N 个周几的日期（weekday: 0=Mon, 4=Fri）"""
+    d = date(year, month, 1)
+    while d.weekday() != weekday:
+        d += timedelta(days=1)
+    return d
 
 
-def fetch_week_releases(api_key: str) -> dict[str, list[dict]]:
-    """查询本周一至周五的指标，按日期分组返回"""
-    monday_str, friday_str, _, _ = _this_week_range()
-    logger.info(f"查询 FRED API，范围：{monday_str} ~ {friday_str}")
+def _weekday_near(year: int, month: int, day: int) -> date:
+    """返回某月 day 号附近最近的周一到周五"""
+    d = date(year, month, day)
+    while d.weekday() >= 5:  # 跳过周末
+        d += timedelta(days=1)
+    return d
 
-    url = "https://api.stlouisfed.org/fred/releases/dates"
-    params = {
-        "realtime_start": monday_str,
-        "realtime_end": friday_str,
-        "api_key": api_key,
-        "file_type": "json",
-    }
 
-    try:
-        resp = requests.get(url, params=params, timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
-    except requests.RequestException as e:
-        logger.error(f"FRED API 请求失败: {e}")
-        return {}
+def _calculate_indicators(mon: date, fri: date) -> list[dict]:
+    """纯算法计算本周一至周五之间发布的指标"""
+    results = []
 
-    tracked_ids = set(INDICATORS.keys())
-    seen_rids: set[int] = set()  # 同指标只保留最早日期
-    by_date: dict[str, list[dict]] = {}
+    # ── 初请失业金人数：每周四 ──
+    d = mon
+    while d <= fri:
+        if d.weekday() == 3:  # 周四
+            results.append({
+                "date": d, "name": "初请失业金人数", "time": "20:30",
+                "impact": "medium",
+                "description": "美国劳动力市场高频领先指标",
+                "gold": "高于预期 → 利好金价（避险）\n低于预期 → 利空金价",
+                "stock": "高于预期 → 利空股市\n低于预期 → 利好股市",
+            })
+        d += timedelta(days=1)
 
-    for entry in data.get("release_dates", []):
-        rid = entry.get("release_id")
-        date = entry.get("date", "")
-        if rid in tracked_ids and monday_str <= date <= friday_str:
-            if rid in seen_rids:
-                continue  # 跳过同一指标的后续日期
-            seen_rids.add(rid)
-            info = INDICATORS[rid]
-            by_date.setdefault(date, []).append({
-                "name": info["name"],
-                "time": info["time"],
-                "impact": info["impact"],
-                "description": info["description"],
-                "gold": info["gold"],
-                "stock": info["stock"],
+    # ── 非农就业 (NFP)：每月第一个周五 ──
+    for month_val in sorted({mon.month, fri.month}):
+        nfp = _first_weekday_of_month(mon.year if month_val >= mon.month else fri.year,
+                                       month_val, 4)  # 4=Friday
+        if mon <= nfp <= fri:
+            results.append({
+                "date": nfp, "name": "非农就业 (NFP)", "time": "20:30",
+                "impact": "high",
+                "description": "美国就业市场最全面的月度报告",
+                "gold": "超预期 → 利空金价（美元走强）\n低于预期 → 利好金价（避险升温）",
+                "stock": "超预期 → 利好股市（经济强劲）\n低于预期 → 利空股市（衰退担忧）",
             })
 
-    logger.info(f"本周共 {sum(len(v) for v in by_date.values())} 个指标，分布在 {len(by_date)} 天")
-    return by_date
+    # ── CPI：每月 10 号附近（BLS 通常在 10-14 号发布） ──
+    for month_val in sorted({mon.month, fri.month}):
+        cpi = _weekday_near(mon.year if month_val >= mon.month else fri.year,
+                            month_val, 10)
+        # CPI 通常在周三/周四
+        while cpi.weekday() < 2:  # 不是周一周二
+            cpi += timedelta(days=1)
+        while cpi.weekday() >= 5:
+            cpi += timedelta(days=1)
+        if mon <= cpi <= fri:
+            results.append({
+                "date": cpi, "name": "CPI 消费者物价指数", "time": "20:30",
+                "impact": "high",
+                "description": "衡量通货膨胀最核心的指标",
+                "gold": "超预期 → 利空金价（加息预期升温）\n低于预期 → 利好金价（加息预期降温）",
+                "stock": "超预期 → 利空股市（加息预期）\n低于预期 → 利好股市（宽松预期）",
+            })
+
+    # ── FOMC 利率决议：硬编码日程 ──
+    for fomc_date in FOMC_2026:
+        if mon <= fomc_date <= fri:
+            results.append({
+                "date": fomc_date, "name": "FOMC 利率决议", "time": "02:00（次日凌晨）",
+                "impact": "high",
+                "description": "美联储议息会议利率决定",
+                "gold": "鹰派（加息/偏鹰）→ 利空金价\n鸽派（降息/偏鸽）→ 利好金价",
+                "stock": "鹰派 → 利空股市\n鸽派 → 利好股市（资金面宽松）",
+            })
+
+    # ── GDP 季率：季度结束后约一个月 ──
+    gdp_months = {1: date(mon.year, 1, 27), 4: date(mon.year, 4, 27),
+                  7: date(mon.year, 7, 27), 10: date(mon.year, 10, 27)}
+    for g in gdp_months.values():
+        gdp_date = _weekday_near(g.year, g.month, g.day)
+        if mon <= gdp_date <= fri:
+            results.append({
+                "date": gdp_date, "name": "GDP 季率（初值）", "time": "20:30",
+                "impact": "medium",
+                "description": "美国经济增长综合指标",
+                "gold": "超预期 → 利空金价（美元强）\n低于预期 → 利好金价（避险）",
+                "stock": "超预期 → 利好股市\n低于预期 → 利空股市",
+            })
+
+    # ── 核心 PCE：每月月底 ──
+    for month_val in sorted({mon.month, fri.month}):
+        pce = _weekday_near(mon.year if month_val >= mon.month else fri.year,
+                            month_val, 27)
+        if mon <= pce <= fri:
+            results.append({
+                "date": pce, "name": "核心 PCE 物价指数", "time": "20:30",
+                "impact": "medium",
+                "description": "美联储最看重的通胀指标",
+                "gold": "超预期 → 利空金价\n低于预期 → 利好金价",
+                "stock": "超预期 → 利空股市（加息压力）\n低于预期 → 利好股市",
+            })
+
+    # ── 零售销售：每月中旬（14号附近） ──
+    for month_val in sorted({mon.month, fri.month}):
+        rs = _weekday_near(mon.year if month_val >= mon.month else fri.year,
+                           month_val, 14)
+        if mon <= rs <= fri:
+            results.append({
+                "date": rs, "name": "零售销售月率", "time": "20:30",
+                "impact": "low",
+                "description": "美国消费支出强度指标",
+                "gold": "超预期 → 略利空金价\n低于预期 → 略利好金价",
+                "stock": "超预期 → 利好消费板块\n低于预期 → 利空消费板块",
+            })
+
+    # 按日期和影响排序，去重（同一天同名只保留一个）
+    seen = set()
+    results = [r for r in sorted(results, key=lambda r: r["date"])
+               if not (seen.add((r["date"], r["name"])) and False)]
+
+    return results
 
 
-def format_weekly_message(by_date: dict[str, list[dict]]) -> str:
-    """格式化为本周预览消息"""
-    _, _, display_start, display_end = _this_week_range()
+# ── 周范围计算 ────────────────────────────────────────────
+
+def _this_week_range() -> tuple[date, date]:
+    now = datetime.now(BEIJING_TZ).date()
+    mon = now - timedelta(days=now.weekday())
+    fri = mon + timedelta(days=4)
+    return mon, fri
+
+
+# ── 消息格式化 ────────────────────────────────────────────
+
+def format_weekly_message(indicators: list[dict]) -> str:
+    mon, fri = _this_week_range()
     impact_emoji = {"high": "🔴", "medium": "🟡", "low": "🟢"}
 
-    lines = [f"## 📅 本周经济指标预览（{display_start} - {display_end}）\n"]
+    messages = [f"## 📅 本周经济指标（{mon.strftime('%m/%d')} - {fri.strftime('%m/%d')}）\n"]
+    messages.append(f"共 **{len(indicators)}** 个重要事件\n")
 
-    for date_str in sorted(by_date.keys()):
-        releases = by_date[date_str]
-        # 按影响排序
-        releases.sort(key=lambda r: {"high": 0, "medium": 1, "low": 2}[r["impact"]])
+    # 按天分组
+    by_date: dict[date, list[dict]] = {}
+    for r in indicators:
+        by_date.setdefault(r["date"], []).append(r)
 
-        dt = datetime.strptime(date_str, "%Y-%m-%d")
-        day_label = f"{dt.strftime('%m/%d')} {WEEKDAY_NAMES[dt.weekday()]}"
+    # 无事件的日期也标出来
+    d = mon
+    while d <= fri:
+        day_label = f"{d.strftime('%m/%d')} {WEEKDAY_NAMES[d.weekday()]}"
 
-        lines.append(f"### 📆 {day_label}")
+        if d not in by_date:
+            messages.append(f"### {day_label}")
+            messages.append("🟢 _暂无重要指标_\n")
+        else:
+            messages.append(f"### {day_label}")
+            for r in by_date[d]:
+                emoji = impact_emoji.get(r["impact"], "⚪")
+                messages.append(f"{emoji} **{r['name']}**  {r['time']}（北京）")
+                messages.append(f"　📈 股市：{r['stock'].split(chr(10))[0]}")
+                messages.append(f"　🥇 金价：{r['gold'].split(chr(10))[0]}")
+                messages.append("")
+        messages.append("")
+        d += timedelta(days=1)
 
-        for r in releases:
-            emoji = impact_emoji.get(r["impact"], "⚪")
-            lines.append(f"{emoji} **{r['name']}**  {r['time']}（北京）")
-            lines.append(f"　_{r['description']}_")
-            lines.append(f"　📈 股市：{r['stock'].split(chr(10))[0]}")
-            lines.append(f"　🥇 金价：{r['gold'].split(chr(10))[0]}")
-            lines.append("")
-
-        lines.append("")
-
-    lines.append(f"> 🤖 每周一早 8:00 自动推送 | 数据来源：FRED")
-    return "\n".join(lines)
+    messages.append(f"> 🤖 每周一早 8:00 自动推送 | 算法计算 + FOMC 硬编码")
+    return "\n".join(messages)
 
 
 def send_wechat(send_key: str, title: str, content: str) -> bool:
     url = f"https://sctapi.ftqq.com/{send_key}.send"
     try:
         resp = requests.post(url, data={"title": title, "desp": content}, timeout=15)
-        return resp.json().get("code") == 0
+        if resp.json().get("code") == 0:
+            logger.info("微信推送成功")
+            return True
+        logger.error(f"推送失败: {resp.json()}")
+        return False
     except requests.RequestException as e:
         logger.error(f"Server酱 请求失败: {e}")
         return False
 
 
+# ── 入口 ──────────────────────────────────────────────────
+
 def main():
     config = load_config()
 
     if "--test" in sys.argv:
-        logger.info("发送测试消息...")
-        ok = send_wechat(
-            config["server_chan_key"],
-            "🧪 经济指标提醒 - 测试消息",
-            "如果你收到这条消息，说明 Server酱 配置正确！",
-        )
-        print("✅ 测试消息发送成功" if ok else "❌ 测试消息发送失败")
+        send_wechat(config["server_chan_key"],
+                     "🧪 经济指标提醒 - 测试消息",
+                     "如果你收到这条消息，说明配置正确！")
+        print("已发送测试消息")
         return
 
-    # 查询本周
-    by_date = fetch_week_releases(config["fred_api_key"])
+    mon, fri = _this_week_range()
+    indicators = _calculate_indicators(mon, fri)
+    logger.info(f"本周 {mon} ~ {fri}，共 {len(indicators)} 个指标")
+    for r in indicators:
+        logger.info(f"  {r['date']} {r['name']}")
 
-    if not by_date:
-        logger.info("本周无关注的经济指标发布")
+    if not indicators:
+        logger.info("本周无关注的经济指标")
         return
+
+    content = format_weekly_message(indicators)
 
     if "--dry-run" in sys.argv:
-        print(format_weekly_message(by_date))
+        print(content)
         return
 
-    # 推送微信
-    _, _, display_start, display_end = _this_week_range()
-    total = sum(len(v) for v in by_date.values())
-    title = f"📅 本周经济指标（{display_start}-{display_end}）共{total}个"
-    content = format_weekly_message(by_date)
-    ok = send_wechat(config["server_chan_key"], title, content)
-
-    logger.info("完成" if ok else "推送失败")
-    for date_str in sorted(by_date.keys()):
-        for r in by_date[date_str]:
-            logger.info(f"  {date_str}  {r['name']} ({r['time']})")
+    send_wechat(config["server_chan_key"],
+                f"📅 本周经济指标（{mon.strftime('%m/%d')}-{fri.strftime('%m/%d')}）",
+                content)
 
 
 if __name__ == "__main__":
