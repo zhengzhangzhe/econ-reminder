@@ -44,18 +44,18 @@ def load_config() -> dict:
     return config
 
 
-# ── FOMC 2026 日程（美联储提前公布） ──────────────────────
-# 格式: (声明发布日期, "描述")
-# FOMC 每次会议结束当天（通常是周三）下午 2:00 ET 发布声明
-FOMC_2026 = [
-    date(2026, 1, 28),
-    date(2026, 3, 18),
-    date(2026, 5, 6),
-    date(2026, 6, 17),
-    date(2026, 7, 29),
-    date(2026, 9, 16),
-    date(2026, 11, 5),
-    date(2026, 12, 16),
+# ── FOMC 2026 日程（来源：federalreserve.gov/monetarypolicy/fomccalendars.htm）──
+# 已转为北京时间：美国 14:00 ET 发布会 → 北京次日 02:00
+# * = 含经济预测摘要 (SEP)
+FOMC_2026_BEIJING = [
+    date(2026, 1, 29),   # Jan 27-28 → announcement Jan 28 US → Beijing Jan 29
+    date(2026, 3, 19),   # Mar 17-18* → announcement Mar 18 → Beijing Mar 19
+    date(2026, 4, 30),   # Apr 28-29 → announcement Apr 29 → Beijing Apr 30
+    date(2026, 6, 18),   # Jun 16-17* → announcement Jun 17 → Beijing Jun 18
+    date(2026, 7, 30),   # Jul 28-29 → announcement Jul 29 → Beijing Jul 30
+    date(2026, 9, 17),   # Sep 15-16* → announcement Sep 16 → Beijing Sep 17
+    date(2026, 10, 29),  # Oct 27-28 → announcement Oct 28 → Beijing Oct 29
+    date(2026, 12, 10),  # Dec 8-9* → announcement Dec 9 → Beijing Dec 10
 ]
 
 # ── 算法：计算各指标的发布日期 ────────────────────────────
@@ -88,6 +88,7 @@ def _calculate_indicators(mon: date, fri: date) -> list[dict]:
             results.append({
                 "date": d, "name": "初请失业金人数", "time": "20:30",
                 "impact": "medium",
+                "estimated": False,  # 每周四固定
                 "description": "美国劳动力市场高频领先指标",
                 "gold": "高于预期 → 利好金价（避险）\n低于预期 → 利空金价",
                 "stock": "高于预期 → 利空股市\n低于预期 → 利好股市",
@@ -102,17 +103,17 @@ def _calculate_indicators(mon: date, fri: date) -> list[dict]:
             results.append({
                 "date": nfp, "name": "非农就业 (NFP)", "time": "20:30",
                 "impact": "high",
-                "description": "美国就业市场最全面的月度报告",
+                "estimated": True, "description": "美国就业市场最全面的月度报告",
                 "gold": "超预期 → 利空金价（美元走强）\n低于预期 → 利好金价（避险升温）",
                 "stock": "超预期 → 利好股市（经济强劲）\n低于预期 → 利空股市（衰退担忧）",
             })
 
-    # ── CPI：每月 10 号附近（BLS 通常在 10-14 号发布） ──
+    # ── CPI：每月 10 号附近（BLS 通常在 10-15 号发布，多为周三/周四） ──
     for month_val in sorted({mon.month, fri.month}):
         cpi = _weekday_near(mon.year if month_val >= mon.month else fri.year,
                             month_val, 10)
-        # CPI 通常在周三/周四
-        while cpi.weekday() < 2:  # 不是周一周二
+        # CPI 通常不在周一周二
+        while cpi.weekday() < 2:
             cpi += timedelta(days=1)
         while cpi.weekday() >= 5:
             cpi += timedelta(days=1)
@@ -120,18 +121,18 @@ def _calculate_indicators(mon: date, fri: date) -> list[dict]:
             results.append({
                 "date": cpi, "name": "CPI 消费者物价指数", "time": "20:30",
                 "impact": "high",
-                "description": "衡量通货膨胀最核心的指标",
+                "estimated": True, "description": "衡量通货膨胀最核心的指标",
                 "gold": "超预期 → 利空金价（加息预期升温）\n低于预期 → 利好金价（加息预期降温）",
                 "stock": "超预期 → 利空股市（加息预期）\n低于预期 → 利好股市（宽松预期）",
             })
 
-    # ── FOMC 利率决议：硬编码日程 ──
-    for fomc_date in FOMC_2026:
+    # ── FOMC 利率决议：硬编码日程（已是北京时间） ──
+    for fomc_date in FOMC_2026_BEIJING:
         if mon <= fomc_date <= fri:
             results.append({
-                "date": fomc_date, "name": "FOMC 利率决议", "time": "02:00（次日凌晨）",
+                "date": fomc_date, "name": "FOMC 利率决议", "time": "02:00",
                 "impact": "high",
-                "description": "美联储议息会议利率决定",
+                "estimated": False, "description": "美联储议息会议利率决定",
                 "gold": "鹰派（加息/偏鹰）→ 利空金价\n鸽派（降息/偏鸽）→ 利好金价",
                 "stock": "鹰派 → 利空股市\n鸽派 → 利好股市（资金面宽松）",
             })
@@ -145,7 +146,7 @@ def _calculate_indicators(mon: date, fri: date) -> list[dict]:
             results.append({
                 "date": gdp_date, "name": "GDP 季率（初值）", "time": "20:30",
                 "impact": "medium",
-                "description": "美国经济增长综合指标",
+                "estimated": True, "description": "美国经济增长综合指标",
                 "gold": "超预期 → 利空金价（美元强）\n低于预期 → 利好金价（避险）",
                 "stock": "超预期 → 利好股市\n低于预期 → 利空股市",
             })
@@ -158,20 +159,22 @@ def _calculate_indicators(mon: date, fri: date) -> list[dict]:
             results.append({
                 "date": pce, "name": "核心 PCE 物价指数", "time": "20:30",
                 "impact": "medium",
-                "description": "美联储最看重的通胀指标",
+                "estimated": True, "description": "美联储最看重的通胀指标",
                 "gold": "超预期 → 利空金价\n低于预期 → 利好金价",
                 "stock": "超预期 → 利空股市（加息压力）\n低于预期 → 利好股市",
             })
 
-    # ── 零售销售：每月中旬（14号附近） ──
+    # ── 零售销售：每月中旬（16号附近，通常周二-周四） ──
     for month_val in sorted({mon.month, fri.month}):
         rs = _weekday_near(mon.year if month_val >= mon.month else fri.year,
-                           month_val, 14)
+                           month_val, 16)
+        while rs.weekday() < 1 or rs.weekday() >= 5:
+            rs += timedelta(days=1)
         if mon <= rs <= fri:
             results.append({
                 "date": rs, "name": "零售销售月率", "time": "20:30",
                 "impact": "low",
-                "description": "美国消费支出强度指标",
+                "estimated": True, "description": "美国消费支出强度指标",
                 "gold": "超预期 → 略利空金价\n低于预期 → 略利好金价",
                 "stock": "超预期 → 利好消费板块\n低于预期 → 利空消费板块",
             })
@@ -219,7 +222,8 @@ def format_weekly_message(indicators: list[dict]) -> str:
             messages.append(f"### {day_label}")
             for r in by_date[d]:
                 emoji = impact_emoji.get(r["impact"], "⚪")
-                messages.append(f"{emoji} **{r['name']}**  {r['time']}（北京）")
+                est_tag = "（预计）" if r.get("estimated") else ""
+                messages.append(f"{emoji} **{r['name']}**{est_tag}  {r['time']}（北京）")
                 messages.append(f"　📈 股市：{r['stock'].split(chr(10))[0]}")
                 messages.append(f"　🥇 金价：{r['gold'].split(chr(10))[0]}")
                 messages.append("")
