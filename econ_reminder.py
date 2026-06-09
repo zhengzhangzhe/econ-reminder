@@ -149,12 +149,16 @@ def fetch_week_releases(api_key: str) -> dict[str, list[dict]]:
         return {}
 
     tracked_ids = set(INDICATORS.keys())
+    seen_rids: set[int] = set()  # 同指标只保留最早日期
     by_date: dict[str, list[dict]] = {}
 
     for entry in data.get("release_dates", []):
         rid = entry.get("release_id")
         date = entry.get("date", "")
         if rid in tracked_ids and monday_str <= date <= friday_str:
+            if rid in seen_rids:
+                continue  # 跳过同一指标的后续日期
+            seen_rids.add(rid)
             info = INDICATORS[rid]
             by_date.setdefault(date, []).append({
                 "name": info["name"],
